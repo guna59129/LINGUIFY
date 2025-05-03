@@ -3,7 +3,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from docx import Document
 from pptx import Presentation
 from PIL import Image
-import pytesseract
 import requests
 from bs4 import BeautifulSoup
 from readability import Document as ReadabilityDocument
@@ -115,8 +114,8 @@ def extract_text_from_image(uploaded_file):
         return f"Error: Unable to open image file. {str(e)}"
     
     img_byte_arr = io.BytesIO()
-    image.save(img_byte_arr, format='PNG')  # Convert to PNG format
-    img_byte_arr = img_byte_arr.getvalue()  # Get the byte data
+    image.save(img_byte_arr, format='PNG')  
+    img_byte_arr = img_byte_arr.getvalue()  
 
     try:
         response = requests.post(
