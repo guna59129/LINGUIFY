@@ -1,139 +1,174 @@
-import streamlit as st
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import google.generativeai as genai
-from langchain.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+import streamlit as st
 from dotenv import load_dotenv
-from langchain.schema import Document
-
-st.set_page_config(page_title="Chat with PDF", layout="wide", page_icon="💬")
-
-page_bg_img = """
-<style>
-[data-testid="stAppViewContainer"] {
-    background-image: url("bookshelf_background.png");
-    background-size: cover;
-    background-position: center;
-    background-attachment: fixed;
-    font-family: 'Courier New', Courier, monospace;
-}
-[data-testid="stSidebar"] {
-    background-color: rgba(0, 0, 0, 0.9);
-    font-family: 'Courier New', Courier, monospace;
-}
-</style>
-"""
-st.markdown(page_bg_img, unsafe_allow_html=True)
+from openai import OpenAI
+import extract
 
 load_dotenv()
-os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+api_key = os.getenv("NVIDIA_API_KEY")
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=api_key
+)
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    chunks = text_splitter.split_text(text)
-    return chunks
+def chunk_text(text, max_tokens=3000, overlap=500):
+    chunk_size = max_tokens * 4
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size - overlap)]
 
-def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
+def build_prompt(content, summary_type):
+    return f"Provide a {summary_type} and neat summary of the following text without any tables, bullet points, or special characters like asterisks and plus signs:\n\n{content}"
 
-def get_conversational_chain():
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
-
-    Answer:
-    """
-    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    return chain
-
-def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    docs = new_db.similarity_search(user_question)
-    chain = get_conversational_chain()
-    response = chain(
-        {"input_documents": docs, "question": user_question},
-        return_only_outputs=True,
+def summarize_chunk(content, summary_type, max_output_tokens):
+    prompt = build_prompt(content, summary_type)
+    response = client.chat.completions.create(
+        model="nvidia/llama-3.3-nemotron-super-49b-v1",
+        messages=[
+            {"role": "system", "content": "You are a helpful summarization assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.6,
+        top_p=0.95,
+        max_tokens=max_output_tokens,
+        stream=False
     )
-    st.success("💡 Reply: " + response["output_text"])
+    summary = response.choices[0].message.content.strip()
+    lines = summary.split("\n")
+    if len(lines) > 1:
+        summary = "\n".join(lines[1:]).strip()
+    return summary
 
-def summarize_text(raw_text):
-    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-    prompt_template = """
-    Summarize the following text as concisely as possible, while retaining the main ideas:\n\n
-    {context}\n\n
-    Summary:
-    """
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    document = Document(page_content=raw_text)
-    response = chain(
-        {"input_documents": [document], "context": raw_text}
+def summarize_file(full_text, summary_type):
+    token_map = {"Brief": 500, "Detailed": 1024, "Important": 800}
+    chunks = chunk_text(full_text)
+    return "\n\n".join(summarize_chunk(chunk, summary_type, token_map[summary_type]) for chunk in chunks)
+
+def ask_question(content, question):
+    prompt = f"""Answer the question strictly based on the text below. Do not include any introductions, bullet points, or special characters.
+
+Text:
+\"\"\"{content}\"\"\" 
+
+Question:
+{question}
+"""
+    response = client.chat.completions.create(
+        model="nvidia/llama-3.3-nemotron-super-49b-v1",
+        messages=[
+            {"role": "system", "content": "You respond with concise, direct answers only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        top_p=0.9,
+        max_tokens=512,
+        stream=False
     )
-    return response["output_text"]
+    return response.choices[0].message.content.strip()
 
-def main():
-    st.title("💬 Chat with Your PDF")
-    st.markdown("---")
+def find_answer_in_text(text, question):
+    for chunk in chunk_text(text):
+        answer = ask_question(chunk, question)
+        if "not present in the document" not in answer.lower():
+            return answer
+    return "The answer is not present in the document."
 
-    st.sidebar.markdown("### 📂 Upload Your PDFs")
-    pdf_docs = st.sidebar.file_uploader(
-        "Drag & Drop or Select PDF Files",
-        accept_multiple_files=True,
-        type=["pdf"],
-    )
-    st.sidebar.markdown("---")
-    
-    user_question = st.text_input("🔎 Ask a Question from the PDF Files")
-    if user_question:
-        placeholder=st.empty()
-        placeholder.write("Querying...")
-        user_input(user_question)
-        placeholder.empty()
+st.set_page_config(page_title="LINGUAVOX", layout="wide")
 
-    if st.sidebar.button("📝 Summarize PDF"):
-        if pdf_docs:
-            st.write("Summarizing your files...")
-            raw_text = get_pdf_text(pdf_docs)
-            summary = summarize_text(raw_text)
-            st.info("📃 Summary: " + summary)
+st.sidebar.header("📁 Upload a File or Provide URL")
+
+input_mode = st.sidebar.radio("Select Input Type", ["Upload File", "Enter URL"])
+
+uploaded_file = None
+url_input = ""
+
+if input_mode == "Upload File":
+    uploaded_file = st.sidebar.file_uploader("Upload a file", type=["pdf", "txt", "docx", "pptx", "png", "jpg", "jpeg"])
+elif input_mode == "Enter URL":
+    url_input = st.sidebar.text_input("Provide the URL here")
+
+mode = st.sidebar.selectbox("Select Operation", ["Summarize", "Q&A"])
+
+if uploaded_file or url_input:
+    if uploaded_file:
+        filename = uploaded_file.name
+        file_ext = filename.split('.')[-1].lower()
+
+        extracted_text = ""
+
+        if file_ext == "pdf":
+            extracted_text = extract.extract_text_from_pdf(uploaded_file)
+        elif file_ext == "txt":
+            extracted_text = extract.extract_text_from_txt(uploaded_file)
+        elif file_ext == "docx":
+            extracted_text = extract.extract_text_from_docx(uploaded_file)
+        elif file_ext == "pptx":
+            extracted_text = extract.extract_text_from_pptx(uploaded_file)
+        elif file_ext in ["png", "jpg", "jpeg"]:
+            extracted_text = extract.extract_text_from_image(uploaded_file)
         else:
-            st.error("🚨 Please upload PDF files before summarizing.")
+            st.error("Unsupported file type.")
+            st.stop()
+    elif url_input:
+        extracted_text = extract.extract_text_from_url(url_input)
 
-    if st.sidebar.button("⚙ Submit & Process"):
-        if pdf_docs:
-            st.write("Processing your files...")
-            raw_text = get_pdf_text(pdf_docs)
-            text_chunks = get_text_chunks(raw_text)
-            get_vector_store(text_chunks)
-            st.success("✅ Files processed successfully!")
-        else:
-            st.error("🚨 Please upload PDF files before processing.")
+    st.session_state["text_data"] = extracted_text
+
+    if mode == "Summarize":
+        summary_type = st.sidebar.selectbox("Summary Type", ["Brief", "Detailed", "Important"])
+        if st.sidebar.button("📝 Generate Summary"):
+            with st.spinner("Generating summary..."):
+                st.session_state["summary"] = summarize_file(extracted_text, summary_type)
+                st.session_state["mode_selected"] = "Summarize"
+
+    elif mode == "Q&A":
+        if st.sidebar.button("📄 Process for Q&A"):
+            st.session_state["processed_text"] = extracted_text
+            st.session_state["mode_selected"] = "Q&A"
+            st.session_state["qa_ready"] = True
+            st.success("File/URL processed! You can now ask questions.")
+
+    elif mode == "Full Text":
+        st.session_state["processed_text"] = extracted_text
+        st.session_state["mode_selected"] = "Full Text"
+        st.success("Full Text loaded. You can ask questions.")
+
+output_ready = (
+    (st.session_state.get("mode_selected") == "Summarize" and "summary" in st.session_state) or
+    (st.session_state.get("mode_selected") == "Q&A" and st.session_state.get("qa_ready", False)) or
+    (st.session_state.get("mode_selected") == "Full Text" and "processed_text" in st.session_state)
+)
+
+if not output_ready:
+    st.markdown("""
+    <div style='text-align: center;'>
+        <h1 style='font-weight: bold;'>LINGUIFY</h1>
+        <h3 style='color: gray;'>Understand, Summarize & Query Any Document — Intelligently</h3>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown(
-        "👨‍💻 Developed by Guna Sekhar | [GitHub](https://github.com/) | [LinkedIn](https://linkedin.com/) "
-    )
+    st.markdown("### 🌟 Features")
+    st.markdown("""
+    - 📝 *Summarization*: Quickly generate summaries from your documents.
+    - ❓ *Question & Answer*: Ask questions and get intelligent answers from your uploaded file.
+    """)
+else:
+    st.markdown("## 🎯 Generated Content")
 
-if __name__ == "__main__":
-    main()
+    if st.session_state.get("mode_selected") == "Summarize" and "summary" in st.session_state:
+        with st.expander("📃 View Generated Summary", expanded=True):
+            st.text_area("Summary", value=st.session_state["summary"], height=400)
+
+    elif st.session_state.get("mode_selected") == "Q&A" and st.session_state.get("qa_ready", False):
+        with st.expander("❓ Ask Questions About the Document", expanded=True):
+            question = st.text_input("Type your question:")
+            if question:
+                with st.spinner("Searching for the answer..."):
+                    answer = find_answer_in_text(st.session_state["processed_text"], question)
+                st.session_state["latest_answer"] = answer
+                st.success("✅ Answer:")
+                st.write(answer)
+
+    elif st.session_state.get("mode_selected") == "Full Text" and "processed_text" in st.session_state:
+        with st.expander("📜 Full Text", expanded=True):
+            st.text_area("Full Text", value=st.session_state["processed_text"], height=400)
