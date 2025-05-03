@@ -12,3 +12,4 @@ lxml
 readability-lxml
 langchain-community
 lxml_html_clean
+pypdf
