@@ -72,7 +72,7 @@ def find_answer_in_text(text, question):
             return answer
     return "The answer is not present in the document."
 
-st.set_page_config(page_title="LINGUAVOX", layout="wide")
+st.set_page_config(page_title="LINGUIFY", layout="wide")
 
 st.sidebar.header("📁 Upload a File or Provide URL")
 
